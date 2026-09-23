@@ -42,9 +42,13 @@ class WindFarmOptimizerCLI:
     """风电场优化命令行接口主类。"""
 
     def __init__(self, config: WindFarmConfig) -> None:
+        # 先做完整校验：任何非法配置都在创建输出目录或运行对象之前抛出，
+        # 不会在磁盘上留下半成品输出目录。
+        config.validate()
         self.config = config
-        self._setup_output_dir()
 
+        # 每台风机都是独立实例；尾流/边界/风资源均为本次运行新建对象，
+        # 保证配置 -> 运行对象的一对一语义。
         self.turbines = config.create_turbines()
         self.boundary = config.create_boundary()
         self.wind_resource = config.create_wind_resource()
@@ -69,12 +73,20 @@ class WindFarmOptimizerCLI:
         self.economic_result: Optional[EconomicResult] = None
         self.sweep_results: Optional[dict] = None
 
-    def _setup_output_dir(self) -> None:
-        """创建输出目录。"""
+        self._output_dir_prepared = False
+
+    def _ensure_output_dir(self) -> str:
+        """惰性创建输出目录。
+
+        只有在确实需要写入图表或结果文件时才创建目录，保证错误输入
+        不会先产生空的半成品输出目录。
+        """
         output_dir = self.config.visualization.save_dir
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        print(f"输出目录: {os.path.abspath(output_dir)}")
+        if not self._output_dir_prepared:
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"输出目录: {os.path.abspath(output_dir)}")
+            self._output_dir_prepared = True
+        return output_dir
 
     def _print_header(self, title: str) -> None:
         print("\n" + "=" * 60)
@@ -228,12 +240,29 @@ class WindFarmOptimizerCLI:
             pct = cost / self.economic_result.total_capital_cost * 100
             print(f"    {item}: {cost/1e4:.2f} 亿元 ({pct:.1f}%)")
 
-    def run_turbine_sweep(self, min_turbines: int = 5, max_turbines: int = 25, step: int = 2) -> None:
-        """运行风机台数扫描分析。"""
+    def run_turbine_sweep(self, min_turbines: int = 5, max_turbines: int = 25, step: int = 1) -> None:
+        """运行风机台数扫描分析。
+
+        每个台数都使用独立的风机实例和独立的 AEP 计算器，不修改主流程
+        的 ``config`` / ``turbines`` / ``aep_calc``，因此扫描结果与主分析、
+        交互分析和批量运行之间可以稳定重放。
+        """
+        if not (isinstance(min_turbines, int) and isinstance(max_turbines, int)
+                and isinstance(step, int)):
+            raise ValueError("台数扫描的 min/max/step 必须是整数")
+        if min_turbines < 1:
+            raise ValueError(f"台数扫描最小值必须 >= 1，当前为 {min_turbines}")
+        if max_turbines < min_turbines:
+            raise ValueError(
+                f"台数扫描最大值({max_turbines})不能小于最小值({min_turbines})"
+            )
+        if step < 1:
+            raise ValueError(f"台数扫描步长必须 >= 1，当前为 {step}")
+
         self._print_header("步骤 4/6: 风机台数扫描分析")
 
         print(f"扫描范围: {min_turbines} ~ {max_turbines} 台，步长 {step}")
-        print("此分析将为不同台数快速优化布局并评估经济性")
+        print("此分析将为不同台数快速生成基线布局并评估经济性")
 
         sweep_data = {
             "n_turbines": [],
@@ -242,42 +271,41 @@ class WindFarmOptimizerCLI:
         }
 
         rng = np.random.default_rng(self.config.optimization.seed)
-        original_n = self.config.n_turbines
-
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
-        farm_cost = get_default_farm_cost()
-        analyzer = EconomicAnalyzer(
-            turbine_cost=turbine_cost,
-            farm_cost=farm_cost,
-            electricity_price=self.config.economic.electricity_price,
-        )
 
         for n in range(min_turbines, max_turbines + 1, step):
             print(f"\n  分析 {n} 台风机...")
-            self.config.n_turbines = n
-            self.turbines = [self.turbines[0] for _ in range(n)]
-            self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
-            self.rated_powers = np.array([t.rated_power for t in self.turbines])
 
-            self.aep_calc = AEPCalculator(
-                turbines=self.turbines,
+            # 独立实例：不复用、不修改主流程的任何运行对象。
+            turbines = self.config.create_turbines(n)
+            rotor_diameters = np.array([t.rotor_diameter for t in turbines])
+            aep_calc = AEPCalculator(
+                turbines=turbines,
                 wind_resource=self.wind_resource,
-                wake_model=self.wake_model,
+                wake_model=self.config.create_wake_model(),
                 wake_superposition=self.config.superposition_method,
+            )
+
+            turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+            farm_cost = get_default_farm_cost()
+            farm_cost.discount_rate = self.config.economic.discount_rate
+            analyzer = EconomicAnalyzer(
+                turbine_cost=turbine_cost,
+                farm_cost=farm_cost,
+                electricity_price=self.config.economic.electricity_price,
             )
 
             try:
                 positions = generate_grid_layout(
                     boundary=self.boundary,
                     n_turbines=n,
-                    rotor_diameters=self.rotor_diameters,
+                    rotor_diameters=rotor_diameters,
                     min_multiple=self.config.optimization.min_spacing_multiple,
                     rng=rng,
                 )
 
-                result = self.aep_calc.compute_farm_aep(positions)
+                result = aep_calc.compute_farm_aep(positions)
 
-                rated_power_MW = self.turbines[0].rated_power / 1e3
+                rated_power_MW = turbines[0].rated_power / 1e3
                 econ_result = analyzer.analyze(
                     n_turbines=n,
                     rated_power_per_turbine_MW=rated_power_MW,
@@ -285,23 +313,28 @@ class WindFarmOptimizerCLI:
                 )
 
                 sweep_data["n_turbines"].append(n)
-                sweep_data["aep"].append(result.net_aep)
-                sweep_data["lcoe"].append(econ_result.lcoe)
+                sweep_data["aep"].append(float(result.net_aep))
+                sweep_data["lcoe"].append(float(econ_result.lcoe))
 
                 print(f"    净AEP: {result.net_aep/1e3:.1f} GWh, LCOE: {econ_result.lcoe:.3f} 元/kWh")
-            except Exception as e:
+            except (RuntimeError, ValueError) as e:
+                # 几何上放不下的台数属于扫描的正常越界，跳过即可。
                 print(f"    跳过: {e}")
 
         self.sweep_results = sweep_data
-        self.config.n_turbines = original_n
 
     def run_visualization(self) -> None:
         """生成所有可视化图表。"""
         self._print_header("步骤 5/6: 生成可视化图表")
 
-        save_dir = self.config.visualization.save_dir
         save = self.config.visualization.save_plots
         show = self.config.visualization.show_plots
+
+        if not save and not show:
+            print("未启用图表输出，跳过可视化")
+            return
+
+        save_dir = self._ensure_output_dir() if save else self.config.visualization.save_dir
 
         if save:
             print("图表将保存到:", os.path.abspath(save_dir))
@@ -399,14 +432,31 @@ class WindFarmOptimizerCLI:
         """保存所有结果到JSON文件。"""
         self._print_header("步骤 6/6: 保存结果数据")
 
-        output_dir = self.config.visualization.save_dir
+        output_dir = self._ensure_output_dir()
 
+        # 记录最终生效的完整配置（含文件配置与命令行覆写合并后的值），
+        # 便于事后复核与重放。
+        effective_config = self.config.to_dict()
         results = {
+            "effective_config": effective_config,
+            # 保留扁平化的关键字段，方便快速查阅。
             "config": {
                 "n_turbines": self.config.n_turbines,
                 "turbine_model": self.config.turbine_model,
                 "wake_model": self.config.wake_model,
-                "min_spacing_multiple": self.config.optimization.min_spacing_multiple,
+                "wake_decay": float(self.config.wake_decay),
+                "superposition_method": self.config.superposition_method,
+                "algorithm": self.config.optimization.algorithm,
+                "population_size": self.config.optimization.population_size,
+                "max_iterations": self.config.optimization.max_iterations,
+                "min_spacing_multiple": float(
+                    self.config.optimization.min_spacing_multiple
+                ),
+                "seed": self.config.optimization.seed,
+                "boundary_type": self.config.boundary_type,
+                "boundary_params": self.config.boundary_params,
+                "electricity_price": float(self.config.economic.electricity_price),
+                "discount_rate": float(self.config.economic.discount_rate),
             },
             "site": {
                 "area_km2": float(self.boundary.area / 1e6),
@@ -740,10 +790,14 @@ def main() -> int:
         print(f"示例配置已生成: {os.path.abspath(args.generate_config)}")
         return 0
 
-    if args.config:
-        config = WindFarmConfig.from_json(args.config)
-    else:
-        config = create_sample_config()
+    try:
+        if args.config:
+            config = WindFarmConfig.from_json(args.config)
+        else:
+            config = create_sample_config()
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        print(f"\n配置错误: {e}", file=sys.stderr)
+        return 2
 
     if args.n_turbines is not None:
         config.n_turbines = args.n_turbines
@@ -782,7 +836,24 @@ def main() -> int:
     if args.no_economic:
         config.economic.enable_analysis = False
 
-    cli = WindFarmOptimizerCLI(config)
+    # 台数扫描范围提前校验（不属于 WindFarmConfig，在入口处拦截）。
+    if args.sweep:
+        if args.min_turbines < 1:
+            parser.error(f"--min-turbines 必须 >= 1，当前为 {args.min_turbines}")
+        if args.max_turbines < args.min_turbines:
+            parser.error(
+                f"--max-turbines({args.max_turbines}) 不能小于 "
+                f"--min-turbines({args.min_turbines})"
+            )
+
+    try:
+        # 构造函数内部先做 config.validate()，通过后才创建任何运行对象；
+        # 输出目录改为惰性创建，因此非法输入不会留下半成品目录。
+        cli = WindFarmOptimizerCLI(config)
+    except ValueError as e:
+        print(f"\n配置错误: {e}", file=sys.stderr)
+        return 2
+
     cli._min_turbines = args.min_turbines
     cli._max_turbines = args.max_turbines
 
@@ -796,6 +867,9 @@ def main() -> int:
             save=True,
         )
         return 0
+    except ValueError as e:
+        print(f"\n错误: {e}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"\n错误: {e}", file=sys.stderr)
         import traceback
