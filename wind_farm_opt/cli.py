@@ -12,7 +12,7 @@ from typing import Optional
 
 import numpy as np
 
-from .config import WindFarmConfig, create_sample_config
+from .config import ConfigError, WindFarmConfig, create_sample_config
 from .core.turbine import Turbine
 from .core.wind_resource import WindResource
 from .core.wake import WakeModel
@@ -42,24 +42,19 @@ class WindFarmOptimizerCLI:
     """风电场优化命令行接口主类。"""
 
     def __init__(self, config: WindFarmConfig) -> None:
+        # 先校验，再触碰文件系统：非法配置不得留下半成品输出目录。
+        config.validate()
         self.config = config
         self._setup_output_dir()
 
+        # 每台风机都是独立实例，互不共享可写状态。
         self.turbines = config.create_turbines()
         self.boundary = config.create_boundary()
         self.wind_resource = config.create_wind_resource()
         self.wake_model = config.create_wake_model()
 
-        self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
-        self.rated_powers = np.array([t.rated_power for t in self.turbines])
-        self.thrust_coefficients = np.array([t.thrust_coefficient for t in self.turbines])
-
-        self.aep_calc = AEPCalculator(
-            turbines=self.turbines,
-            wind_resource=self.wind_resource,
-            wake_model=self.wake_model,
-            wake_superposition=config.superposition_method,
-        )
+        self._refresh_turbine_arrays()
+        self.aep_calc = self._rebuild_aep_calculator()
 
         self.baseline_positions: Optional[np.ndarray] = None
         self.baseline_result: Optional[FarmResult] = None
@@ -75,6 +70,28 @@ class WindFarmOptimizerCLI:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         print(f"输出目录: {os.path.abspath(output_dir)}")
+
+    def _refresh_turbine_arrays(self) -> None:
+        """根据当前风机列表重建派生数组。"""
+        self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
+        self.rated_powers = np.array([t.rated_power for t in self.turbines])
+        self.thrust_coefficients = np.array([t.thrust_coefficient for t in self.turbines])
+
+    def _rebuild_aep_calculator(self, turbines=None) -> AEPCalculator:
+        """（重新）构建 AEP 计算器。
+
+        Parameters
+        ----------
+        turbines :
+            指定风机列表（例如台数扫描使用的独立列表）；缺省使用主列表。
+        """
+        turbines = self.turbines if turbines is None else turbines
+        return AEPCalculator(
+            turbines=turbines,
+            wind_resource=self.wind_resource,
+            wake_model=self.wake_model,
+            wake_superposition=self.config.superposition_method,
+        )
 
     def _print_header(self, title: str) -> None:
         print("\n" + "=" * 60)
@@ -228,24 +245,40 @@ class WindFarmOptimizerCLI:
             pct = cost / self.economic_result.total_capital_cost * 100
             print(f"    {item}: {cost/1e4:.2f} 亿元 ({pct:.1f}%)")
 
-    def run_turbine_sweep(self, min_turbines: int = 5, max_turbines: int = 25, step: int = 2) -> None:
-        """运行风机台数扫描分析。"""
+    def run_turbine_sweep(self, min_turbines: int = 5, max_turbines: int = 25, step: int = 1) -> None:
+        """运行风机台数扫描分析。
+
+        扫描在独立的风机/计算器对象上进行，不修改主配置与主运行状态，
+        因此扫描结果与批量主运行、交互分析可以稳定复现。
+        """
         self._print_header("步骤 4/6: 风机台数扫描分析")
 
-        print(f"扫描范围: {min_turbines} ~ {max_turbines} 台，步长 {step}")
-        print("此分析将为不同台数快速优化布局并评估经济性")
+        if not isinstance(min_turbines, int) or min_turbines < 1:
+            raise ConfigError(f"台数扫描最小值必须是不小于1的整数，当前为 {min_turbines!r}")
+        if not isinstance(max_turbines, int) or max_turbines < min_turbines:
+            raise ConfigError(
+                f"台数扫描最大值必须是不小于最小值({min_turbines})的整数，当前为 {max_turbines!r}"
+            )
+        if not isinstance(step, int) or step < 1:
+            raise ConfigError(f"台数扫描步长必须是不小于1的整数，当前为 {step!r}")
 
-        sweep_data = {
+        # 用最大台数提前做容量可行性校验，避免扫描中途失败。
+        self.config.validate(n_turbines=max_turbines)
+
+        print(f"扫描范围: {min_turbines} ~ {max_turbines} 台，步长 {step}")
+        print("此分析将为不同台数快速评估网格布局与经济性")
+
+        sweep_data: dict[str, list] = {
             "n_turbines": [],
             "aep": [],
             "lcoe": [],
         }
 
         rng = np.random.default_rng(self.config.optimization.seed)
-        original_n = self.config.n_turbines
 
         turbine_cost = get_default_turbine_cost(self.config.turbine_model)
         farm_cost = get_default_farm_cost()
+        farm_cost.discount_rate = self.config.economic.discount_rate
         analyzer = EconomicAnalyzer(
             turbine_cost=turbine_cost,
             farm_cost=farm_cost,
@@ -254,30 +287,24 @@ class WindFarmOptimizerCLI:
 
         for n in range(min_turbines, max_turbines + 1, step):
             print(f"\n  分析 {n} 台风机...")
-            self.config.n_turbines = n
-            self.turbines = [self.turbines[0] for _ in range(n)]
-            self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
-            self.rated_powers = np.array([t.rated_power for t in self.turbines])
 
-            self.aep_calc = AEPCalculator(
-                turbines=self.turbines,
-                wind_resource=self.wind_resource,
-                wake_model=self.wake_model,
-                wake_superposition=self.config.superposition_method,
-            )
+            # 每个台数使用全新的独立风机实例与独立计算器。
+            sweep_turbines = self.config.create_turbines(n)
+            sweep_diameters = np.array([t.rotor_diameter for t in sweep_turbines])
+            sweep_aep_calc = self._rebuild_aep_calculator(turbines=sweep_turbines)
 
             try:
                 positions = generate_grid_layout(
                     boundary=self.boundary,
                     n_turbines=n,
-                    rotor_diameters=self.rotor_diameters,
+                    rotor_diameters=sweep_diameters,
                     min_multiple=self.config.optimization.min_spacing_multiple,
                     rng=rng,
                 )
 
-                result = self.aep_calc.compute_farm_aep(positions)
+                result = sweep_aep_calc.compute_farm_aep(positions)
 
-                rated_power_MW = self.turbines[0].rated_power / 1e3
+                rated_power_MW = sweep_turbines[0].rated_power / 1e3
                 econ_result = analyzer.analyze(
                     n_turbines=n,
                     rated_power_per_turbine_MW=rated_power_MW,
@@ -293,7 +320,6 @@ class WindFarmOptimizerCLI:
                 print(f"    跳过: {e}")
 
         self.sweep_results = sweep_data
-        self.config.n_turbines = original_n
 
     def run_visualization(self) -> None:
         """生成所有可视化图表。"""
@@ -402,11 +428,20 @@ class WindFarmOptimizerCLI:
         output_dir = self.config.visualization.save_dir
 
         results = {
+            # 最终生效的关键参数（含命令行覆写与嵌套缺省补全），供结果复核。
+            "effective_parameters": self.config.effective_parameters(),
             "config": {
                 "n_turbines": self.config.n_turbines,
                 "turbine_model": self.config.turbine_model,
                 "wake_model": self.config.wake_model,
+                "wake_decay": float(self.config.wake_decay),
+                "superposition_method": self.config.superposition_method,
                 "min_spacing_multiple": self.config.optimization.min_spacing_multiple,
+                "algorithm": self.config.optimization.algorithm,
+                "population_size": self.config.optimization.population_size,
+                "max_iterations": self.config.optimization.max_iterations,
+                "discount_rate": float(self.config.economic.discount_rate),
+                "electricity_price": float(self.config.economic.electricity_price),
             },
             "site": {
                 "area_km2": float(self.boundary.area / 1e6),
@@ -741,7 +776,11 @@ def main() -> int:
         return 0
 
     if args.config:
-        config = WindFarmConfig.from_json(args.config)
+        try:
+            config = WindFarmConfig.from_json(args.config)
+        except ConfigError as exc:
+            print(f"\n配置错误: {exc}", file=sys.stderr)
+            return 2
     else:
         config = create_sample_config()
 
@@ -782,7 +821,21 @@ def main() -> int:
     if args.no_economic:
         config.economic.enable_analysis = False
 
-    cli = WindFarmOptimizerCLI(config)
+    # 命令行覆写后再做一次完整校验；此时尚未创建任何输出目录。
+    try:
+        if args.sweep:
+            config.validate(n_turbines=args.max_turbines)
+        config.validate()
+    except ConfigError as exc:
+        print(f"\n配置错误: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        cli = WindFarmOptimizerCLI(config)
+    except ConfigError as exc:
+        print(f"\n配置错误: {exc}", file=sys.stderr)
+        return 2
+
     cli._min_turbines = args.min_turbines
     cli._max_turbines = args.max_turbines
 
